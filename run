@@ -1,0 +1,20 @@
+#!/bin/bash
+# Run Python scripts with the project root on PYTHONPATH.
+# On macOS, also sets DYLD_LIBRARY_PATH for libiio v0.25 (SDR support).
+#
+# For RAK-only use (no SDR), you can run scripts directly:
+#   python chat.py
+# This wrapper is only needed for SDR/Pluto support on macOS.
+PROJ_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONPATH="$PROJ_DIR:${PYTHONPATH:-}"
+
+if [ "$(uname)" = "Darwin" ]; then
+    export DYLD_LIBRARY_PATH="$PROJ_DIR/.venv/lib:${DYLD_LIBRARY_PATH:-}"
+fi
+
+# Use the venv Python if available, otherwise system Python
+if [ -x "$PROJ_DIR/.venv/bin/python" ]; then
+    exec "$PROJ_DIR/.venv/bin/python" "$@"
+else
+    exec python3 "$@"
+fi
