@@ -56,12 +56,26 @@ def get_status(bus):
     return mode, cmd_status
 
 
+def get_errors(bus):
+    """GetDeviceErrors (opcode 0x17). Returns raw 16-bit error word."""
+    resp = spi_transfer(bus, [0x17, 0x00, 0x00, 0x00])
+    return (resp[2] << 8) | resp[3]
+
+
 STATUS_MODES = {
     2: "STDBY_RC", 3: "STDBY_XOSC", 4: "FS", 5: "RX", 6: "TX",
 }
 CMD_STATUSES = {
     1: "ok", 2: "data available", 3: "timeout", 5: "processing error", 6: "exec failure",
 }
+ERROR_FLAGS = [
+    "RC64K_CALIB", "RC13M_CALIB", "PLL_CALIB", "ADC_CALIB",
+    "IMG_CALIB", "XOSC_START", "PLL_LOCK", "PA_RAMP",
+]
+
+
+def error_names(err):
+    return [ERROR_FLAGS[i] for i in range(8) if err & (1 << i)]
 
 
 def main():
@@ -74,6 +88,13 @@ def main():
         print(f"error: cannot open /dev/i2c-{I2C_BUS}: {e}")
         print("check permissions: ls -la /dev/i2c-2")
         return 1
+
+    # Drain any stale bytes from the ATtiny circular buffer
+    for _ in range(128):
+        try:
+            bus.read_byte(I2C_ADDR)
+        except Exception:
+            break
 
     print(f"I2C bus {I2C_BUS} opened, bridge at 0x{I2C_ADDR:02x}\n")
 
@@ -96,8 +117,7 @@ def main():
     print("\ntest 2: GetStatus + SetStandby")
     mode, cmd_st = get_status(bus)
     print(f"  status: mode={STATUS_MODES.get(mode, mode)}, cmd={CMD_STATUSES.get(cmd_st, cmd_st)}")
-    # SetStandby STDBY_RC (opcode 0x80, arg 0x00)
-    spi_transfer(bus, [0x80, 0x00])
+    spi_transfer(bus, [0x80, 0x00])  # SetStandby STDBY_RC
     time.sleep(0.01)
     mode, cmd_st = get_status(bus)
     print(f"  after SetStandby: mode={STATUS_MODES.get(mode, mode)}, cmd={CMD_STATUSES.get(cmd_st, cmd_st)}")
@@ -113,7 +133,6 @@ def main():
     orig_lo = read_register(bus, REG_SYNCWORD_LO)
     print(f"  original sync word: 0x{orig_hi:02x} 0x{orig_lo:02x}")
 
-    # Write a different value
     test_hi, test_lo = 0x34, 0x44
     write_register(bus, REG_SYNCWORD_HI, test_hi)
     write_register(bus, REG_SYNCWORD_LO, test_lo)
@@ -127,9 +146,71 @@ def main():
     else:
         print(f"  PASS: write/readback matches")
 
-    # Restore original values
     write_register(bus, REG_SYNCWORD_HI, orig_hi)
     write_register(bus, REG_SYNCWORD_LO, orig_lo)
+
+    # --- Test 4: TCXO and radio configuration ---
+    print("\ntest 4: TCXO + radio config")
+
+    # SetDio3AsTcxoCtrl: 1.7V, max timeout (~262s)
+    # The backplate uses a TCXO on DIO3. It needs a long startup time
+    # (500ms observed). Max timeout keeps it powered in all states.
+    spi_transfer(bus, [0x97, 0x01, 0xFF, 0xFF, 0xFF])
+    time.sleep(0.5)
+
+    # Clear errors and calibrate
+    spi_transfer(bus, [0x07, 0x00, 0x00])  # ClearDeviceErrors
+    spi_transfer(bus, [0x89, 0x7F])         # Calibrate(all)
+    time.sleep(0.1)
+
+    err = get_errors(bus)
+    if err:
+        print(f"  FAIL: calibration errors 0x{err:04x} {error_names(err)}")
+        failed = True
+    else:
+        print(f"  PASS: TCXO started, calibration clean")
+
+    # Configure radio: LoRa, 915 MHz, SF7/BW125k/CR4-5
+    spi_transfer(bus, [0x9D, 0x01])  # SetDio2AsRfSwitchCtrl
+    spi_transfer(bus, [0x8A, 0x01])  # SetPacketType = LoRa
+    freq_reg = int(915e6 * (2**25) / 32e6)
+    spi_transfer(bus, [0x86, (freq_reg >> 24) & 0xFF, (freq_reg >> 16) & 0xFF,
+                       (freq_reg >> 8) & 0xFF, freq_reg & 0xFF])
+    spi_transfer(bus, [0x98, 0xE1, 0xE9])  # CalibrateImage 902-928 MHz
+    time.sleep(0.1)
+    spi_transfer(bus, [0x07, 0x00, 0x00])   # ClearDeviceErrors
+    spi_transfer(bus, [0x95, 0x04, 0x07, 0x00, 0x01])  # SetPaConfig (SX1262)
+    spi_transfer(bus, [0x8E, 0x16, 0x04])   # SetTxParams +22dBm
+    spi_transfer(bus, [0x8B, 0x07, 0x04, 0x01, 0x00])  # SetModulationParams
+
+    err = get_errors(bus)
+    mode, cmd_st = get_status(bus)
+    if err:
+        print(f"  FAIL: config errors 0x{err:04x} {error_names(err)}")
+        failed = True
+    elif cmd_st != 1:
+        print(f"  FAIL: cmd_status={CMD_STATUSES.get(cmd_st, cmd_st)}")
+        failed = True
+    else:
+        print(f"  PASS: radio configured (915 MHz, SF7/BW125k/CR4-5, +22 dBm)")
+
+    # --- Test 5: buffer write/readback ---
+    print("\ntest 5: TX buffer write/readback")
+    spi_transfer(bus, [0x8F, 0x00, 0x00])  # SetBufferBaseAddress
+    payload = b"Hello from PinePhone!"
+    spi_transfer(bus, [0x0E, 0x00] + list(payload))  # WriteBuffer
+
+    # ReadBuffer
+    resp = spi_transfer(bus, [0x1E, 0x00, 0x00] + [0x00] * len(payload))
+    readback = bytes(resp[3:])
+
+    if readback == payload:
+        print(f"  PASS: buffer roundtrip ({len(payload)} bytes)")
+    else:
+        print(f"  FAIL: buffer mismatch")
+        print(f"    wrote: {payload}")
+        print(f"    read:  {readback}")
+        failed = True
 
     # --- Summary ---
     bus.close()
