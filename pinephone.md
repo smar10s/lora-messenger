@@ -138,6 +138,12 @@ The PinePhone should be SSH-accessible from the laptop. Ideal setup:
 - SX1262 datasheet: https://files.pine64.org/doc/datasheet/pinephone/DS_SX1261-2_V1.1-1307803.pdf
 - ATtiny I2C-SPI bridge firmware: https://github.com/zschroeder6212/tiny-i2c-spi
 - Semtech SX126x reference driver (JF's fork): https://github.com/JF002/LoRaMac-node
+- **JF's PinePhone LoRa driver (Codeberg)**: https://codeberg.org/JF002/pinedio-lora-driver
+  - C++ driver with working TX and RX, `pinephone-communicator` chat app
+  - Uses SudoMaker/sx126x_driver for SX126x abstraction
+  - Previously tested on our exact phone/backplate with a RAK monitoring serial — both TX and RX confirmed working
+- **JF's backplate selftest**: https://codeberg.org/JF002/pine64_lora_backplate_selftest
+  - Simple C tool: write/read SX1262 buffer via I2C bridge, verifies hardware path
 - JF blog - first look at backplate: https://codingfield.com/blog/2021-11/first-look-at-lora-pinephone-backplate/
 - JF blog - flashing the ATtiny: https://codingfield.com/blog/2021-11/flash-the-lora-pinephone-backplate/
 - JF blog - driver and demo: https://codingfield.com/blog/2021-11/a-driver-for-the-pinephone-lora-backplate/

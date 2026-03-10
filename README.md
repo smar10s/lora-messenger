@@ -143,6 +143,15 @@ for whitening, CRC, and header encoding were informed by
 (Tapparel et al., EPFL, GPL-3.0) and the public reverse-engineering work
 it builds on.
 
+PinePhone LoRa backplate support was informed by
+[JF002's pinedio-lora-driver](https://codeberg.org/JF002/pinedio-lora-driver)
+(Jean-François Milants, LGPLv3), which provides a working C++ driver for
+the PinePhone backplate's ATtiny84 I2C-to-SPI bridge and SX1262 radio.
+JF's [blog series](https://codingfield.com/blog/2021-11/a-driver-for-the-pinephone-lora-backplate/)
+on reverse-engineering the backplate hardware was invaluable. The ATtiny84
+bridge firmware is [tiny-i2c-spi](https://github.com/zschroeder6212/tiny-i2c-spi)
+by Zachary Schroeder (GPL-3.0).
+
 ## License
 
 [MIT](LICENSE)
