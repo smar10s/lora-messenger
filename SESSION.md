@@ -205,11 +205,13 @@ docs/plans/          design documents (historical)
 
 ## What's next (rough ideas, not ordered)
 
-- **PinePhone TX/RX** — SPI bridge and radio config work (see session log
-  2026-03-09 below), but SetTx/SetRx/SetFs never cause a state transition.
-  Likely cause: BUSY pin not checked by the ATtiny bridge. Next step: find
-  the BUSY pin GPIO on the backplate, or add conservative delays matching
-  SX1262 datasheet worst-case times for each command class.
+- **PinePhone Python driver** — TX and RX confirmed working with JF's C++
+  driver (see 2026-03-10 session). Need to port the working approach to
+  Python: ATtiny buffer sync (`SyncI2CBuffer` pattern-match), 10ms
+  inter-command delays, and the full SX126x init sequence. Avoid calling
+  `Calibrate(0x7F)` directly — it wedges the chip. JF's driver doesn't
+  call it explicitly; the SX126x library handles it internally during
+  `Init()` which does `Reset -> Wakeup -> SetStandby -> SetPacketType`.
 - **Robustness testing** — longer sessions, different environments, varying
   antenna distances. The demod works at close range with high SNR; behavior at
   lower SNR is untested.
@@ -367,18 +369,79 @@ SetRx, SetFs) need the PLL to lock, and the chip may reject them if BUSY is
 still high from a previous command. The SX1262 doesn't report this as an
 error — it just silently ignores the command.
 
-**Next steps:**
-1. Check the backplate schematic for BUSY pin routing. If it's on a pogo
-   pin -> GPIO, we can poll it from Linux.
-2. If BUSY isn't accessible, try aggressive delays (10-50ms) before each
-   state-change command, matching SX1262 datasheet worst-case BUSY times.
-3. Alternative theory: the ATtiny bridge might have a timing issue with
-   longer SPI transactions where CS deassertion matters. Worth checking
-   with a logic analyzer if delays don't fix it.
+**Prior art — JF's working TX/RX on this exact hardware:**
+- **Driver + chat app**: https://codeberg.org/JF002/pinedio-lora-driver
+  (`pinephone-communicator` — bidirectional LoRa chat, C++/CMake, LGPLv3)
+- **Selftest tool**: https://codeberg.org/JF002/pine64_lora_backplate_selftest
+- **SX1262 driver used**: SudoMaker/sx126x_driver (C++ header-only SX126x)
+- **Blog series**: codingfield.com/blog/2021-11/ (first look, flashing ATtiny,
+  driver writeup with photo of successful RX from PyCom LoPy)
 
 **Dev setup established:**
 - PinePhone: postmarketOS, Python 3.10.4, smbus2, i2c-tools, udev rule
   for /dev/i2c-2 permissions
 - SSH: `ssh user@192.168.1.83` (key auth, no password)
-- Dependencies: `sudo apk add i2c-tools py3-pip && sudo pip3 install smbus2`
+- Dependencies: `sudo apk add i2c-tools py3-pip cmake g++ make git linux-headers && sudo pip3 install smbus2`
+- JF's driver: `~/pinedio-lora-driver/` (built, pinephone-communicator works)
 
+### 2026-03-10: PinePhone TX/RX confirmed with JF's driver
+
+Goal: get SetTx/SetRx working on the PinePhone LoRa backplate. The previous
+session established SPI connectivity but state-change commands were silently
+ignored.
+
+**Investigation (Python driver):**
+- Studied JF's pinedio-lora-driver on Codeberg. Key finding: the PinePhone
+  backplate has **no BUSY pin access** — it's unconnected. JF fakes
+  BUSY=low with 10ms fixed delays. NRESET is tied to the ATtiny's own
+  reset pin (PB3), so it can't be toggled independently.
+- Increased inter-command delays from 5ms to 10ms (matching JF), added
+  missing `SetRegulatorMode(USE_DCDC)`, reordered init to match JF's
+  sequence. Fixed `get_irq()` response byte parsing (was off by 2).
+- **Root cause identified**: the ATtiny84's 128-byte circular SPI response
+  buffer needs precise synchronization. Without JF's `SyncI2CBuffer()`
+  pattern-matching approach, read/write pointer drift causes command
+  responses to be misaligned. Commands appear to fail because we read
+  stale status bytes instead of actual response data.
+- Additional finding: `Calibrate(0x7F)` permanently wedges the SX1262's
+  command processor (register R/W still works, but all state-change
+  commands silently ignored). Survives `SetSleep(cold start)`. Only a
+  full power cycle recovers. This happens both with and without TCXO
+  configuration. Root cause unclear — may be related to the ATtiny sending
+  SPI garbage during simultaneous power-on (CS floats during ATtiny boot
+  before `main()` sets it high).
+- The ATtiny boot-glitch theory is supported by the observation that
+  backplate hot-reattach (powering SX1262 while ATtiny is already running
+  with CS high) produces a clean chip state where all commands work.
+  Cold boot (simultaneous power-on) intermittently corrupts the SX1262.
+
+**Resolution: built JF's C++ driver on the PinePhone.**
+- Cloned `codeberg.org/JF002/pinedio-lora-driver` with SudoMaker/sx126x_driver
+  submodule. Built with `cmake -DBUILD_FOR_PINEPHONE=1`.
+- Patched LoRa params to match our RAK config: 915 MHz, SF7, BW125, CR4/5,
+  standard IQ (was 868 MHz, SF12, BW500, inverted IQ).
+- **TX confirmed**: PinePhone sent "hello world", RAK beacon (LoRaP2P_RX
+  sketch) received at -28 dBm, SNR 13. "PINEPHONE TX OK" also received.
+- **RX confirmed**: RAK (LoRaP2P_TX sketch) sent "Hello" every 5s,
+  PinePhone received all packets cleanly — no byte errors.
+
+**Backplate hardware notes:**
+- BUSY pin: floating/unconnected (not on any ATtiny pin or pogo pin)
+- NRESET: tied to ATtiny PB3 (ATtiny's own reset pin — can't toggle independently)
+- DIO1: connected to ATtiny PA7 + PB2 via 0-ohm resistors, but bridge
+  firmware ignores them. Pogo INT pin via R42 is NOT populated by default.
+- Pogo pins: VCC, GND, SCL(PA4), SDA(PA6), INT(unpopulated). Only 4
+  functional pins (power + I2C).
+
+**What's next:**
+- Port JF's buffer sync and init sequence to Python. The C++ driver's
+  `SyncI2CBuffer()` and `SX126x::Init()` are the reference implementations.
+  Key difference from our Python attempt: JF's sync sends blind writes then
+  scans for a known pattern, and the SX126x driver's `WriteCommand()` does
+  `WaitOnBusy()` (10ms) before every command plus `WaitOnCounter()` (126us)
+  after.
+- Investigate the Calibrate wedge: compare JF's calibration flow vs ours.
+  His driver calls `Init()` which does `Reset() -> Wakeup() -> SetStandby(RC)
+  -> SetPacketType(LORA)`, then the app calls `SetDio2AsRfSwitchCtrl`,
+  `SetStandby`, `SetRegulatorMode`, etc. No explicit `Calibrate(0x7F)` call
+  in the app — the SX126x driver may handle it internally during `Init()`.
