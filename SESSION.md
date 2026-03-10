@@ -201,9 +201,15 @@ docs/plans/          design documents (historical)
 | `tools/listen.py` | Live listener: capture-decode loop, prints payloads |
 | `tools/capture.py` | Capture IQ to `.npy` file |
 | `tools/test_pluto.py` | Quick burst power detector |
+| `tools/test_pinephone.py` | PinePhone backplate hardware test |
 
 ## What's next (rough ideas, not ordered)
 
+- **PinePhone TX/RX** — SPI bridge and radio config work (see session log
+  2026-03-09 below), but SetTx/SetRx/SetFs never cause a state transition.
+  Likely cause: BUSY pin not checked by the ATtiny bridge. Next step: find
+  the BUSY pin GPIO on the backplate, or add conservative delays matching
+  SX1262 datasheet worst-case times for each command class.
 - **Robustness testing** — longer sessions, different environments, varying
   antenna distances. The demod works at close range with high SNR; behavior at
   lower SNR is untested.
@@ -212,7 +218,7 @@ docs/plans/          design documents (historical)
 - Move TX/RX further apart to test at lower SNR
 - Low power / sleep mode experimentation
 - Frequency hopping, different modulation parameters
-- Copy repo to a fresh git init as `lora-messenger` (clean history)
+- ~~Copy repo to a fresh git init as `lora-messenger` (clean history)~~ — done
 
 ## Session log
 
@@ -312,4 +318,67 @@ Code quality pass before publishing. No behavioral changes.
   `if __name__ == "__main__"` guards (no longer execute on import).
 
 **Verified:** 174/174 pytest tests pass.
+
+### 2026-03-09: PinePhone backplate bringup
+
+First session with the PinePhone LoRa backplate. Goal: verify the full
+hardware path and get basic radio operations working.
+
+**Hardware**: PinePhone (original) running postmarketOS v22.06.1 (Alpine
+3.16, kernel 5.17.5, Python 3.10.4). LoRa backplate with SX1262 behind
+ATtiny84 I2C-to-SPI bridge on /dev/i2c-2 at 0x28.
+
+**What works:**
+- SSH from laptop to PinePhone (key-based, non-interactive)
+- I2C bus opens, ATtiny bridge responds at 0x28
+- SPI read/write through bridge: version register (0x0320) = 0x53,
+  consistent across reads. WriteRegister + ReadRegister roundtrips on
+  sync word registers (0x0740/0x0741). Buffer write/readback works.
+- GetStatus returns mode=STDBY_RC, cmd=ok
+- SetStandby, SetPacketType, SetRfFrequency, SetModulationParams,
+  SetPaConfig, SetTxParams, SetDioIrqParams, SetBufferBaseAddress,
+  WriteBuffer — all accepted (cmd=ok, no errors)
+- TCXO on DIO3: 1.7V with max timeout (~262s). Needs 500ms to stabilize.
+  Calibrate(all) succeeds after TCXO warmup. Image calibration for
+  902-928 MHz band also works.
+- `tools/test_pinephone.py`: 5 automated tests all pass
+
+**What doesn't work:**
+- **SetTx, SetRx, SetFs have no effect.** The SX1262 accepts these
+  commands (cmd=ok, zero errors) but never transitions out of STDBY_RC.
+  No TxDone IRQ, no mode change, no error flags.
+
+**Investigation so far:**
+- Tried with and without TCXO, all voltage levels, with/without explicit
+  Calibrate, with/without CalibrateImage, STDBY_RC vs STDBY_XOSC, SX1261
+  vs SX1262 PA config, TX clamp errata workaround, with and without timeout
+  on SetTx, SetFs standalone. None produce a state transition.
+- SPI data integrity verified: 10-byte buffer write/readback is bit-perfect.
+- ATtiny circular buffer sync verified: total_written == total_read (212/212).
+- smbus2 block write limit: 32 bytes (31 SPI bytes + CMD_TRANSMIT). Not an
+  issue for any SX1262 command, but limits WriteBuffer to 31 payload bytes
+  per call.
+
+**Likely root cause: BUSY pin.** The SX1262 requires BUSY to be low before
+accepting new commands. The ATtiny bridge doesn't check BUSY — it fires SPI
+immediately. Register read/write commands are fast (~2us BUSY), so they work
+fine with our 5ms inter-command delay. But state-change commands (SetTx,
+SetRx, SetFs) need the PLL to lock, and the chip may reject them if BUSY is
+still high from a previous command. The SX1262 doesn't report this as an
+error — it just silently ignores the command.
+
+**Next steps:**
+1. Check the backplate schematic for BUSY pin routing. If it's on a pogo
+   pin -> GPIO, we can poll it from Linux.
+2. If BUSY isn't accessible, try aggressive delays (10-50ms) before each
+   state-change command, matching SX1262 datasheet worst-case BUSY times.
+3. Alternative theory: the ATtiny bridge might have a timing issue with
+   longer SPI transactions where CS deassertion matters. Worth checking
+   with a logic analyzer if delays don't fix it.
+
+**Dev setup established:**
+- PinePhone: postmarketOS, Python 3.10.4, smbus2, i2c-tools, udev rule
+  for /dev/i2c-2 permissions
+- SSH: `ssh user@192.168.1.83` (key auth, no password)
+- Dependencies: `sudo apk add i2c-tools py3-pip && sudo pip3 install smbus2`
 

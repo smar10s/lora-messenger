@@ -86,29 +86,37 @@ SX1262 configuration and radio management happens in Python on the phone.
 
 ## Known issues and things to watch
 
-- **One-byte I2C read quirk**: JF found that multi-byte I2C reads only
-  return valid data for the first byte. May be an ATtiny USI library
-  limitation. Test early -- if block reads work from smbus2, great. If
-  not, read byte-by-byte (slow but fine for LoRa data rates).
+- **One-byte I2C read quirk**: confirmed. JF hit this in C and we see
+  it in Python too — `bus.read_byte()` one at a time works, block reads
+  don't. Our `spi_transfer()` reads byte-by-byte in a loop.
 
 - **128-byte circular buffer**: the ATtiny's SPI response buffer is 128
-  bytes with no flow control. Every write produces SPI response bytes
-  that must be read back to keep the buffer indices in sync. Lose sync
-  and recovery requires power cycling.
+  bytes with no flow control. Every SPI byte clocked out produces a
+  response byte that must be read back. We verified sync tracking
+  (total_written == total_read). Drain stale bytes at startup with 128
+  `read_byte()` calls.
 
 - **BUSY pin**: the SX1262 has a BUSY output that must be low before
-  sending new commands. Not clear if this is exposed on the backplate.
-  If not, add conservative delays after each command per datasheet
-  worst-case times.
+  sending new commands. **This is the likely cause of SetTx/SetRx/SetFs
+  having no effect** — the ATtiny bridge doesn't check BUSY, so
+  state-change commands may be silently dropped. Need to check the
+  backplate schematic for BUSY pin routing. If not accessible via GPIO,
+  try conservative delays per datasheet worst-case times.
+
+- **TCXO on DIO3**: confirmed present. Voltage = 1.7V. Needs ~500ms to
+  stabilize from cold start. Use max timeout (0xFFFFFF) to keep it
+  powered across all states. Must call SetDio3AsTcxoCtrl before
+  Calibrate, and CalibrateImage(0xE1, 0xE9) for the 902-928 MHz band.
 
 - **DIO1 interrupt**: connected to the INT pogo pin. Need to identify
   which GPIO this maps to in Linux and whether it's accessible. Without
   it, poll GetIrqStatus in a loop. Works but wastes power.
 
-- **DIO2/DIO3**: DIO2 controls the RF switch (TX/RX antenna path),
-  DIO3 controls TCXO voltage. Both need to be configured correctly
-  during SX1262 init or the radio won't transmit/receive. Check the
-  backplate schematic for how these are wired.
+- **DIO2**: configured as RF switch control via SetDio2AsRfSwitchCtrl.
+
+- **smbus2 block write limit**: 32 bytes total (1 CMD_TRANSMIT + 31 SPI
+  bytes). Not an issue for any SX1262 command, but WriteBuffer calls are
+  limited to 31 payload bytes. Longer payloads need chunked writes.
 
 - **I2C clock speed**: likely 100 kHz. A 255-byte SPI transaction takes
   ~20ms over I2C at that rate. Fine for LoRa, but configuration
