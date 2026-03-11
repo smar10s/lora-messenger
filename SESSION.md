@@ -70,6 +70,7 @@ modem/               modem abstraction
   base.py            LoRaModem ABC, RxPacket dataclass
   rak.py             RAK serial modem
   sdr.py             PlutoSDR modem (software LoRa PHY)
+  pinephone.py       PinePhone backplate modem (I2C-SPI bridge + SX1262)
   loopback.py        loopback modem (testing)
 lora/                software LoRa PHY (pure Python/NumPy)
   common.py          shared primitives (whitening, CRC, chirp gen)
@@ -86,6 +87,15 @@ tools/               SDR development tools
   listen.py          live LoRa receiver
   transmit.py        LoRa packet transmitter
   test_pluto.py      Pluto burst detector
+  test_pinephone.py         PinePhone backplate hardware test
+  test_pinephone_sync.py    I2C-SPI bridge transport test (12 steps)
+  test_pinephone_tx.py      PinePhone TX standalone test
+  test_pinephone_rx.py      PinePhone RX standalone test
+  test_pinephone_modem.py   PinePhoneModem interface test
+  test_pinephone_pingpong.py  Half-duplex TX/RX ping-pong test
+  test_pinephone_stress.py  I2C poll stress test (60s)
+  test_pinephone_chat.py    Headless chat protocol test
+  test_pinephone_ack.py     ACK debugging test (historical)
 tests/               test suite
 docs/plans/          design documents (historical)
 ```
@@ -138,6 +148,20 @@ docs/plans/          design documents (historical)
   fold and multiply operations interact. Oversampled references are still used
   for preamble/SFD alignment where ±1 tolerance is acceptable. See
   `_upchirp_cr` and `_dechirp` vs `_dechirp_os` in `lora/demod.py`.
+- **Half-duplex discipline**: the app treats all devices as half-duplex,
+  even if the hardware supports full-duplex (e.g. Pluto SDR). After
+  transmitting, a device needs time to transition back to RX — up to ~300ms
+  on the PinePhone backplate (SPI command overhead through the ATtiny
+  bridge), less on other hardware, but always nonzero. Any automated
+  response (ACKs, protocol handshakes, future relay confirmations) must be
+  delayed by `HALFDUPLEX_DELAY` (500ms, defined in `chat.py`) before
+  transmission. Human-typed messages don't need the delay — typing is slow
+  enough that the sender is always back in RX. This is an app-level
+  constraint, not a radio constraint: the RAK firmware and SX1262 are
+  capable of near-instant TX, but the remote device won't hear it.
+  The constant is intentionally generous (500ms vs ~300ms worst case) to
+  absorb jitter from the I2C bridge, OS scheduling, and Textual's event
+  loop. Reducing it risks dropped responses on slower devices.
 
 ## Hardware details
 
@@ -201,22 +225,28 @@ docs/plans/          design documents (historical)
 | `tools/listen.py` | Live listener: capture-decode loop, prints payloads |
 | `tools/capture.py` | Capture IQ to `.npy` file |
 | `tools/test_pluto.py` | Quick burst power detector |
-| `tools/test_pinephone.py` | PinePhone backplate hardware test |
+| `tools/test_pinephone.py` | PinePhone backplate hardware test (pre-sync) |
+| `tools/test_pinephone_sync.py` | I2C-SPI bridge transport test (12 steps, post-sync) |
+| `tools/test_pinephone_tx.py` | PinePhone standalone TX test |
+| `tools/test_pinephone_rx.py` | PinePhone standalone RX test |
+| `tools/test_pinephone_modem.py` | PinePhoneModem interface test |
+| `tools/test_pinephone_pingpong.py` | Half-duplex TX/RX cycle test (partner: RAK PingPong firmware) |
+| `tools/test_pinephone_stress.py` | 60s sustained I2C poll stress test |
+| `tools/test_pinephone_chat.py` | Headless chat protocol test (pack/unpack through modem) |
+| `tools/test_pinephone_ack.py` | ACK debugging test (historical) |
 
 ## What's next (rough ideas, not ordered)
 
-- **PinePhone Python driver** — TX and RX confirmed working with JF's C++
-  driver (see 2026-03-10 session). Need to port the working approach to
-  Python: ATtiny buffer sync (`SyncI2CBuffer` pattern-match), 10ms
-  inter-command delays, and the full SX126x init sequence. Avoid calling
-  `Calibrate(0x7F)` directly — it wedges the chip. JF's driver doesn't
-  call it explicitly; the SX126x library handles it internally during
-  `Init()` which does `Reset -> Wakeup -> SetStandby -> SetPacketType`.
+- ~~**PinePhone Python driver**~~ — done. `modem/pinephone.py` implements
+  `LoRaModem` ABC. TX and RX verified against RAK (see 2026-03-10 sessions).
 - **Robustness testing** — longer sessions, different environments, varying
   antenna distances. The demod works at close range with high SNR; behavior at
-  lower SNR is untested.
+  lower SNR is untested. PinePhone modem had one transient I2C OSError during
+  extended polling — needs investigation under sustained use.
 - ~~**Pluto SDR verification**~~ — done. Pluto modem works with 3-byte header.
 - Expand TUI: better layout, status bar
+- ~~Wire `chat.py` to accept `pinephone` as modem type (like `sdr`)~~ — done.
+  Auto-detects via `/dev/i2c-2`.
 - Move TX/RX further apart to test at lower SNR
 - Low power / sleep mode experimentation
 - Frequency hopping, different modulation parameters
@@ -380,7 +410,7 @@ error — it just silently ignores the command.
 **Dev setup established:**
 - PinePhone: postmarketOS, Python 3.10.4, smbus2, i2c-tools, udev rule
   for /dev/i2c-2 permissions
-- SSH: `ssh user@192.168.1.83` (key auth, no password)
+- SSH: `ssh user@<pinephone-ip>` (key auth, no password)
 - Dependencies: `sudo apk add i2c-tools py3-pip cmake g++ make git linux-headers && sudo pip3 install smbus2`
 - JF's driver: `~/pinedio-lora-driver/` (built, pinephone-communicator works)
 
@@ -445,3 +475,281 @@ ignored.
   -> SetPacketType(LORA)`, then the app calls `SetDio2AsRfSwitchCtrl`,
   `SetStandby`, `SetRegulatorMode`, etc. No explicit `Calibrate(0x7F)` call
   in the app — the SX126x driver may handle it internally during `Init()`.
+
+### 2026-03-10: I2C-SPI bridge transport verified
+
+Ported JF's `SyncI2CBuffer` to Python and systematically tested the ATtiny84
+I2C-to-SPI bridge. The transport is rock solid once synced.
+
+**What changed:**
+- `tools/test_pinephone_sync.py`: 12-step bridge transport test. Buffer sync,
+  register roundtrips, buffer write/readback, overflow recovery, empty-read
+  behavior, size guards.
+
+**Key findings:**
+- **Buffer sync works**: JF's pattern-match approach (write known data to
+  SX1262 buffer, issue ReadBuffer, scan I2C output for the pattern) aligns
+  the ATtiny circular buffer reliably. Takes ~28 bytes on clean start.
+- **Transport is deterministic**: 50/50 rapid-fire register roundtrips, all
+  edge values (0x00, 0xFF), buffer transfers up to 28 bytes — zero errors.
+- **10ms inter-command delay not needed for register ops**: back-to-back
+  commands with only 126us post-delay work fine. The 10ms is only needed
+  for SX1262 state-change commands (PLL lock time etc.).
+- **Overflow is recoverable**: flooding 160 response bytes into the 128-byte
+  circular buffer wraps and overwrites, but re-sync always recovers (takes
+  ~40 bytes instead of 28).
+- **Empty reads return stale data**: no sentinel — the buffer recirculates
+  old bytes. Must always read exactly as many bytes as SPI bytes sent.
+- **smbus2 silently accepts oversized writes**: the Linux kernel does NOT
+  reject >32-byte block writes. Added ValueError guard in `i2c_write()` and
+  `spi_command()` to catch this before it reaches the kernel.
+
+**Transport constraints (documented in test):**
+- Max 31 SPI bytes per transfer (smbus2 block limit: 32 including CMD_TRANSMIT)
+- WriteBuffer: max 29 data bytes per chunk (31 - opcode - offset)
+- ReadBuffer: max 28 data bytes per chunk (31 - opcode - offset - NOP)
+- Always read exactly len(spi_data) response bytes — no more, no less
+- Re-sync after any suspected desynchronization
+
+**JF's C++ driver (reference, studied in detail this session):**
+- `PinephoneBackplate::SyncI2CBuffer()`: blind writes then pattern scan
+- `PinephoneBackplate::HalGpioRead()`: returns 0 after 10ms sleep (fake BUSY)
+- `SX126x::WriteCommand()`: WaitOnBusy (10ms) before, WaitOnCounter (126us) after
+- `SX126x::Init()`: Reset -> Wakeup -> SetStandby(RC) -> SetPacketType(LORA)
+- `PinedioLoraRadio::Initialize()`: SetDio2AsRfSwitchCtrl, SetStandby(RC),
+  SetRegulatorMode(DCDC), SetBufferBaseAddresses(0,127), SetTxParams(22,RAMP_3400),
+  SetDioIrqParams, SetRfFrequency(915M), SetPacketType(LORA),
+  SetStopRxTimerOnPreambleDetect(false), SetModulationParams(SF7/BW125/CR4_5),
+  SetPacketParams, ClearIrqStatus, SetRx(0xffffffff)
+- No explicit Calibrate(0x7F) — SetRfFrequency internally calls CalibrateImage
+- Reset/NRESET: can't actually toggle (tied to ATtiny reset), just a 30ms pause
+- Wakeup: sends GetStatus, waits for BUSY (which returns immediately)
+
+### 2026-03-10: PinePhone Python TX/RX confirmed
+
+Built on the verified transport layer to implement full SX1262 init + TX + RX
+in pure Python. Both directions work — no C++ driver needed.
+
+**What changed:**
+- `tools/test_pinephone_tx.py`: full init sequence + TX. Follows JF's driver
+  order exactly: sync, Init (wakeup/standby/packettype), configure (dio2 RF
+  switch, DCDC, PA config, freq with CalibrateImage, modulation/packet params),
+  write payload, SetTx, poll for TxDone IRQ.
+- `tools/test_pinephone_rx.py`: same init, then SetRx(continuous), poll for
+  RxDone IRQ, read payload via GetRxBufferStatus + ReadBuffer.
+
+**Results:**
+- **TX (Pine -> RAK)**: `PINE TX OK` received by RAK at -34 dBm, SNR 13.
+  TxDone IRQ fires correctly. Bit-perfect.
+- **RX (RAK -> Pine)**: 8/8 `Hello` packets received in 30s. RSSI ~-40 dBm,
+  SNR 12-13. Zero CRC errors. Mode transitions to RX correctly.
+- **Root cause confirmed**: the buffer sync was the fix. SetTx/SetRx now work
+  because SPI command/response framing is aligned. The 10ms inter-command delay
+  and JF's init order also matter but sync is the critical piece.
+
+**Key implementation details:**
+- Buffer read chunking: max 28 data bytes per ReadBuffer (smbus2 limit).
+  `read_buffer()` handles multi-chunk reads automatically.
+- No explicit Calibrate(0x7F) — CalibrateImage(902-928 MHz) only, matching JF.
+- IQ polarity workaround (REG 0x0736 bit 2) and TX modulation workaround
+  (REG 0x0889 bit 2) from SX1262 datasheet errata, matching JF's driver.
+- SetRx re-entered after each received packet (JF's pattern).
+
+### 2026-03-10: PinePhoneModem driver
+
+Consolidated the standalone TX/RX test scripts into `modem/pinephone.py` —
+a `PinePhoneModem` implementing the `LoRaModem` ABC. Same interface as
+`RAKModem` and `PlutoModem`: `start()`, `stop()`, `send()`, callbacks.
+
+**What changed:**
+- `modem/pinephone.py`: full driver. Bridge transport (sync, spi_command,
+  size guards), SX1262 init (JF's sequence), TX with TxDone polling, RX
+  with IRQ polling in a background thread. Dedup ring for air packets
+  (same as PlutoModem — PinePhone sees raw relay headers, unlike RAK where
+  firmware strips them).
+- `tools/test_pinephone_modem.py`: exercises the LoRaModem interface.
+
+**Verified:**
+- **TX via modem.send()**: RAK (LoRaMessenger firmware) received both
+  `hello from pine` and `second message` with correct TTL, dedup, CMD byte.
+  RSSI -31 dBm, SNR 13.
+- **RX via modem callback**: received 4/4 `Hello` packets from RAK TX beacon.
+  RSSI ~-42 dBm, SNR 12. CRC OK. (Protocol filter correctly rejects these
+  since the beacon sends raw payload without relay header.)
+- **No I2C errors** during sustained 10s RX poll loop (one transient OSError
+  seen in an earlier run — not reproduced).
+
+**Transport constraints (enforced in driver):**
+- `i2c_write()`: ValueError if >32 bytes (kernel silently truncates)
+- `spi_command()`: ValueError if >31 SPI bytes
+- `_write_buffer()`: auto-chunks at 29 bytes
+- `_read_buffer()`: auto-chunks at 28 bytes
+
+### 2026-03-10: chat.py wired + bidirectional protocol test
+
+Wired `chat.py` to accept `pinephone` as a modem type. Added auto-detection
+(falls back to `pinephone` when `/dev/i2c-2` exists and no serial ports found).
+Added I2C error recovery (re-sync + re-init, 3 attempts with backoff).
+
+**What changed:**
+- `chat.py`: lazy imports for RAKModem/PlutoModem/PinePhoneModem. `detect_port()`
+  auto-detects PinePhone via `/dev/i2c-2`. Usage: `python chat.py pinephone` or
+  auto-detect on PinePhone.
+- `modem/pinephone.py`: added `_recover()` — on OSError, attempts re-sync + re-init
+  up to 3 times with backoff before disconnecting. Extracted `_init_and_enter_rx()`
+  for reuse between initial connect and recovery.
+- `tools/test_pinephone_stress.py`: 60s sustained I2C poll stress test. 1317 polls,
+  zero errors, zero register mismatches. 22 polls/s throughput.
+- `tools/test_pinephone_chat.py`: headless chat protocol test (pack/unpack messages
+  through the modem).
+
+**Verified:**
+- **I2C stress**: 60s, 1317 polls, 0 errors. The earlier transient OSError did not
+  reproduce. Recovery logic added as defensive measure.
+- **Bidirectional chat protocol**: RAK received `hello from pinephone!` (rssi=-33,
+  snr=13). PinePhone received `rak msg 2` (rssi=-48, snr=12). Each side missed one
+  message due to TX/RX timing overlap — normal half-duplex behavior.
+- **chat.py**: runs on PinePhone with `python chat.py pinephone`. Dependencies:
+  textual + cryptography + smbus2 (all pip-installable on postmarketOS).
+
+**PinePhone dev setup (updated):**
+- `~/modem/` — modem package (base.py, pinephone.py)
+- `~/chat.py`, `~/protocol.py` — chat app
+- Deps: `pip3 install textual cryptography smbus2`
+- Run: `python3 chat.py pinephone`
+
+### 2026-03-10: ACK debugging + SX1262 wedge
+
+Investigated why PinePhone never receives ACKs from the laptop (the reverse
+direction works: laptop receives ACKs from PinePhone fine). Wedged the chip
+during debug iterations. The ACK problem was **solved in a later session** —
+see the ping-pong session below.
+
+**Original (incorrect) diagnosis:**
+The CRC errors seen during this session were from thermal/state degradation
+caused by rapid debug iterations, not from the TX→RX transition itself.
+The actual root cause was simpler: the ACK was transmitted before the
+sender finished its TX→RX transition (~266ms of SPI overhead), so the
+ACK was already gone by the time the phone entered RX. Fix: delay
+automated responses by `HALFDUPLEX_DELAY` (500ms) before transmitting.
+
+**What was tried (for reference):**
+During ACK debugging, we iterated rapidly through several variations of
+the post-TxDone sequence, deploying and testing each:
+
+1. (working) Original: `_transmit()` returns, main loop calls `_set_rx()`
+2. (broke TX) Moved `_set_rx()` into `_transmit()` + added
+   `SetBufferBaseAddresses` + `SetPacketParams` between TxDone and SetRx
+3. (broke TX) Same but with `_clear_irq()` after `_set_rx()` + 10ms settle
+4. Several more variations with extra SPI commands between TxDone and SetRx
+
+Each iteration was scp'd and run immediately. The chip stopped responding
+correctly around iteration 3-4. By the time we reverted to known-good code,
+the chip was already wedged — version register returning `0xa2` (status byte),
+register writes having no effect, stuck in RX mode ignoring SetStandby.
+
+**Likely wedge mechanism:** Sending SPI commands to the SX1262 while it's
+in an intermediate state between TX completion and standby. The SX1262
+transitions TX→STDBY_RC automatically after TxDone. If we send commands
+(especially SetBufferBaseAddresses or SetPacketParams) while that transition
+is in progress, and the ATtiny doesn't check BUSY, the chip may receive
+partial/corrupt commands. After enough of these, the command processor locks
+up. This is the same failure mode as the Calibrate(0x7F) wedge from the
+earlier session — the SX1262 enters a state where SPI register R/W works
+but the command processor ignores state-change commands.
+
+**Prevention:** After TxDone, only send `ClearIrqStatus` and `SetRx` — no
+other commands. Any reconfiguration (PacketParams, BufferBaseAddresses)
+should happen BEFORE `SetTx`, not after. The init configures everything
+once; the TX→RX cycle should be minimal.
+
+**Recovery:** Power cycle only. No SPI command (including SetSleep with
+cold start) recovers the command processor once wedged. We confirmed this
+in the 2026-03-09 session.
+
+**State of files on PinePhone after this session:**
+- `~/modem/pinephone.py` — has debug status messages in RX path (showing
+  CRC errors, TTL drops, dedup drops). Remove these once ACK is fixed.
+- `~/chat.py`, `~/protocol.py`, `~/modem/base.py` — current, working
+- `~/test_pinephone_*.py` — all test scripts present
+- The SX1262 is **wedged** — needs power cycle before any testing.
+
+### 2026-03-10: half-duplex ping-pong test — 20/20 pass
+
+Built and verified a ping-pong test to validate the TX→RX half-duplex
+cycle that chat ACKs need. Two new files: `LoRaP2P_PingPong` RAK firmware
+(responder) and `tools/test_pinephone_pingpong.py` (initiator). Protocol:
+PinePhone sends "PING NN", RAK waits 500ms and replies "PONG NN".
+
+**Result: 20/20 rounds, zero CRC errors, zero timeouts.** RTT 854–857ms
+(consistent). RSSI −40 to −57 dBm, SNR 12–14.
+
+**What changed:**
+- `firmware/sketches/examples/LoRaP2P_PingPong/`: RAK responder firmware.
+  Listens for "PING" prefix, waits 500ms, echoes back as "PONG", re-enters
+  RX. Prints all events to serial.
+- `tools/test_pinephone_pingpong.py`: PinePhone initiator. Raw SX1262
+  commands (no modem abstraction, no protocol, no encryption). Reports
+  per-round RTT, RSSI/SNR, and CRC errors.
+
+**Key findings:**
+
+1. **SetPacketParams.PayloadLength controls TX size.** The SX1262 transmitter
+   reads exactly `PayloadLength` bytes from the data buffer — it does not
+   auto-detect from buffer contents. With `PayloadLength=64` and a 7-byte
+   payload, the chip sends 64 bytes (7 real + 57 garbage). Must call
+   `SetPacketParams` with actual length before each TX. The receiver decodes
+   length from the LoRa header, so RX-side `PayloadLength` only sets buffer
+   allocation and does not need updating.
+
+2. **Minimal TX→RX transition is best.** After TxDone: `ClearIrq` + `SetRx`.
+   No `SetStandby`, no `SetBufferBaseAddresses`, no IQ workaround re-apply.
+   Adding commands increases the transition time and risks missing the
+   incoming preamble if the reply arrives quickly.
+
+3. **SX1262 thermal/state degradation under rapid iteration.** During
+   debugging, repeated fast TX→RX cycles caused the SX1262 to enter a state
+   where RX demodulation was corrupted: `RxDone` fires with correct metadata
+   (length, offset, RSSI, SNR) but payload bytes are garbled, always
+   triggering CRC errors. TX continues to work. Transport (SPI register R/W)
+   continues to work. This is a partial wedge — the demodulator is broken
+   but the command processor still responds. Power cycle + cooldown fully
+   recovers. Suspect thermal: the SX1262 is sandwiched between the phone
+   battery and a plastic backplate with no heatsink, generating ~400mW RF +
+   ~400mW DC at +22 dBm. This has not been characterized by anyone else —
+   the Pine64 website has no software for the backplate, and JF's C++ driver
+   PoC was not tested under sustained TX/RX cycling.
+
+4. **Pure RX after fresh power cycle: 8/8 clean.** Confirms the radio works
+   perfectly from cold start. The CRC errors in earlier runs were from
+   accumulated state degradation, not a fundamental driver bug.
+
+**RTT breakdown (~856ms):**
+- PinePhone TX path: ~266ms (SPI overhead: 10ms CMD_DELAY × ~20 commands)
+- PING airtime: ~92ms (SF7/BW125, 7 bytes with preamble)
+- RAK processing + 500ms reply delay: ~510ms
+- PONG airtime: ~92ms
+- PinePhone poll latency: ~50ms (poll interval)
+
+**State of files on PinePhone:**
+- `~/test_pinephone_pingpong.py` — deployed and working
+- `~/modem/pinephone.py` — still has debug status messages; needs the same
+  `SetPacketParams` fix applied in the ping-pong script before ACKs work
+- All other files unchanged from previous session
+
+**ACK fix (same session, after ping-pong):**
+
+Root cause of the original ACK problem: the ACK was transmitted while the
+sender was still in its TX→RX transition. The PinePhone's TX path takes
+~266ms of SPI overhead; the laptop's ACK was sent back through the RAK
+nearly instantly, arriving before the phone entered RX.
+
+Fix: `chat.py` delays all automated responses by `HALFDUPLEX_DELAY` (500ms)
+before transmitting. ACKs are scheduled via `set_timer` instead of sent
+immediately. This is codified as a design decision: the app is half-duplex
+regardless of hardware capability, and any automated response must respect
+the turnaround delay. Human-typed messages are exempt — typing is slow
+enough to be self-throttling.
+
+**Verified:** bidirectional chat with `/ack` between laptop (RAK) and
+PinePhone — ACKs delivered in both directions.

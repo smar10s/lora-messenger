@@ -17,7 +17,6 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 
 from modem.base import RxPacket
-from modem.rak import RAKModem
 from protocol import (
     CMD_MSG, CMD_MSG_ACK_REQ, CMD_ACK, CMD_SET_NAME,
     pack_message, unpack_message,
@@ -38,6 +37,15 @@ NONCE_LEN = 12
 TAG_LEN = 16
 CRYPTO_OVERHEAD = NONCE_LEN + TAG_LEN
 _KDF_SALT = b"LoRaMessenger-v1"
+
+# Half-duplex TX→RX turnaround delay (seconds).
+# After transmitting, a half-duplex device needs time to transition back
+# to RX before it can receive a response. Any automated response (ACKs,
+# protocol handshakes, future features) must be delayed by at least this
+# amount. Human-typed messages don't need the delay — typing is slow
+# enough that the sender will always be back in RX by the time a reply
+# arrives. See SESSION.md "half-duplex discipline" design decision.
+HALFDUPLEX_DELAY = 0.5
 
 
 def derive_key(passphrase: str) -> bytes:
@@ -83,6 +91,9 @@ def detect_port():
     if len(ports) == 1:
         return ports[0]
     if len(ports) == 0:
+        # Check for PinePhone backplate
+        if os.path.exists("/dev/i2c-2"):
+            return "pinephone"
         print("error: no USB serial device found", file=sys.stderr)
         sys.exit(1)
     print(
@@ -266,7 +277,7 @@ class LoRaChat(App):
             name = self._sender_name(sender_uid)
             self.call_from_thread(self._add_received_msg, name, text, pkt.rssi, pkt.snr)
             if cmd == CMD_MSG_ACK_REQ:
-                self.call_from_thread(self._send_ack, pkt.dedup, sender_uid)
+                self.call_from_thread(self._schedule_ack, pkt.dedup, sender_uid)
         elif cmd == CMD_ACK:
             if len(payload) >= 2:
                 acked_dedup = int.from_bytes(payload[:2], "big")
@@ -324,6 +335,14 @@ class LoRaChat(App):
                     payload = encrypt_payload(self._encryption_key, payload)
                 dedup = self._next_dedup()
                 self._modem.send(self._ttl, dedup, payload)
+
+    def _schedule_ack(self, acked_dedup: int, sender_uid: int) -> None:
+        """Schedule an ACK after HALFDUPLEX_DELAY.
+
+        The sender needs time to transition from TX back to RX before
+        it can receive our ACK. See HALFDUPLEX_DELAY.
+        """
+        self.set_timer(HALFDUPLEX_DELAY, lambda: self._send_ack(acked_dedup, sender_uid))
 
     def _send_ack(self, acked_dedup: int, sender_uid: int) -> None:
         """Send an ACK for the given dedup token."""
@@ -458,7 +477,11 @@ def main():
     if port == "sdr":
         from modem.sdr import PlutoModem
         modem = PlutoModem()
+    elif port == "pinephone":
+        from modem.pinephone import PinePhoneModem
+        modem = PinePhoneModem()
     else:
+        from modem.rak import RAKModem
         modem = RAKModem(port)
 
     app = LoRaChat(modem)
