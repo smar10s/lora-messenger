@@ -509,6 +509,7 @@ class LoRaChat(App):
                     name = arg.strip().lower()
                     if name in self.available_themes:
                         self.theme = name
+                        self.refresh_css()
                         self._add_system(f"theme set to {name}")
                     else:
                         self._add_system(f"unknown theme: {name}")
