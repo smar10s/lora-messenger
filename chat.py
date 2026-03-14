@@ -104,13 +104,17 @@ def detect_port():
 
 
 class HistoryInput(Input):
-    """Input widget with up/down arrow history recall."""
+    """Input widget with up/down arrow history recall and tab completion."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, completions_fn=None, **kwargs):
         super().__init__(**kwargs)
         self._history: list[str] = []
         self._history_idx: int = 0
         self._draft: str = ""
+        self._completions_fn = completions_fn  # callable(text) -> list[str]
+        self._tab_matches: list[str] = []
+        self._tab_idx: int = 0
+        self._tab_prefix: str = ""
 
     def record(self, text: str) -> None:
         if text and (not self._history or self._history[-1] != text):
@@ -151,6 +155,28 @@ class HistoryInput(Input):
             self._key_up(event)
         elif event.key == "down":
             self._key_down(event)
+        elif event.key == "tab":
+            event.prevent_default()
+            self._key_tab()
+        else:
+            # Any non-tab key resets tab completion state
+            self._tab_matches = []
+
+    def _key_tab(self) -> None:
+        if not self._completions_fn:
+            return
+        text = self.value
+        if self._tab_matches and text == self._tab_matches[self._tab_idx]:
+            # Cycle to next match
+            self._tab_idx = (self._tab_idx + 1) % len(self._tab_matches)
+        else:
+            # New completion request
+            self._tab_prefix = text
+            self._tab_matches = self._completions_fn(text)
+            self._tab_idx = 0
+        if self._tab_matches:
+            self.value = self._tab_matches[self._tab_idx]
+            self.cursor_position = len(self.value)
 
 
 HELP_TEXT = """/help       show this message
@@ -162,7 +188,10 @@ HELP_TEXT = """/help       show this message
 /key        disable encryption
 /signal     toggle signal info display
 /ttl N      set TTL for outgoing messages (1-5)
+/theme <t>  set color theme (/theme to list)
 /exit       quit (or ctrl+q)"""
+
+SLASH_COMMANDS = ["/help", "/name", "/ack", "/key", "/signal", "/ttl", "/theme", "/exit"]
 
 
 class LoRaChat(App):
@@ -221,10 +250,39 @@ class LoRaChat(App):
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat-log")
         yield HistoryInput(
+            completions_fn=self._complete,
             placeholder="type a message... (/help for commands)",
             max_length=MAX_MSG_LEN,
             id="input",
         )
+
+    def action_focus_next(self) -> None:
+        """Disable tab focus cycling — input always has focus."""
+        pass
+
+    def action_focus_previous(self) -> None:
+        """Disable shift-tab focus cycling."""
+        pass
+
+    def _complete(self, text: str) -> list[str]:
+        """Return tab-completion candidates for the current input."""
+        if not text.startswith("/"):
+            return []
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower()
+
+        # Complete command names
+        if len(parts) == 1 and not text.endswith(" "):
+            return [c for c in SLASH_COMMANDS if c.startswith(cmd)]
+
+        # Complete arguments for specific commands
+        if cmd == "/theme":
+            prefix = parts[1].lower() if len(parts) > 1 else ""
+            themes = sorted(self.available_themes)
+            matches = [t for t in themes if t.startswith(prefix)]
+            return [f"/theme {t}" for t in matches]
+
+        return []
 
     def on_mount(self) -> None:
         self.title = "LoRa Chat"
@@ -447,6 +505,18 @@ class LoRaChat(App):
                     self._ack_mode = not self._ack_mode
                     state = "on" if self._ack_mode else "off"
                     self._add_system(f"ack mode {state}")
+            elif slash == "/theme":
+                if arg:
+                    name = arg.strip().lower()
+                    if name in self.available_themes:
+                        self.theme = name
+                        self._add_system(f"theme set to {name}")
+                    else:
+                        self._add_system(f"unknown theme: {name}")
+                else:
+                    names = ", ".join(sorted(self.available_themes))
+                    self._add_system(f"themes: {names}")
+                    self._add_system(f"current: {self.theme}")
             else:
                 self._add_system(f"unknown command: {text}")
             return
