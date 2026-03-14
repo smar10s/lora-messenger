@@ -24,9 +24,8 @@ from protocol import (
 
 
 # 24-bit colors
-COLOR_SENT = "rgb(100,100,100)"
-COLOR_RECEIVED = "rgb(230,230,230)"
-COLOR_SYSTEM = "rgb(100,140,200)"
+COLOR_MSG = "rgb(230,230,230)"
+COLOR_SYSTEM = "rgb(140,140,140)"
 
 # Max message length: 255 (LoRa packet) - 3 (TTL+DEDUP_HI+DEDUP_LO)
 # - 1 (CMD byte) - 28 (AES-GCM nonce+tag) = 223 bytes.
@@ -190,14 +189,7 @@ class LoRaChat(App):
     .message {
         width: 100%;
         padding: 0 1;
-    }
-
-    .sent {
-        color: """ + COLOR_SENT + """;
-    }
-
-    .received {
-        color: """ + COLOR_RECEIVED + """;
+        color: """ + COLOR_MSG + """;
     }
 
     .system {
@@ -205,15 +197,10 @@ class LoRaChat(App):
         text-style: italic;
     }
 
-    .ack {
-        color: """ + COLOR_SYSTEM + """;
-        text-style: italic;
-        padding: 0 1 0 3;
-    }
-
     #input {
         dock: bottom;
-        height: 3;
+        height: 1;
+        border: none;
         padding: 0 1;
     }
     """
@@ -290,9 +277,10 @@ class LoRaChat(App):
                 self._names[sender_uid] = new_name
                 self.call_from_thread(self._add_name_change, sender_uid, old, new_name)
 
-    def _add_message(self, text: str, css_class: str) -> None:
+    def _add_message(self, text: str, css_class: str = "", markup: bool = False) -> None:
         log = self.query_one("#chat-log", VerticalScroll)
-        msg = Static(text, classes=f"message {css_class}")
+        classes = f"message {css_class}".strip()
+        msg = Static(text, classes=classes, markup=markup)
         log.mount(msg)
         msg.scroll_visible()
 
@@ -301,22 +289,34 @@ class LoRaChat(App):
             return f"[{rssi} dBm, {snr} SNR] "
         return "[--] "
 
+    def _own_name(self) -> str:
+        """Display name for the local user."""
+        return self._user_name or f"user-{self._user_id}"
+
     def _add_sent(self, text: str, dedup: int | None = None) -> None:
         sig = self._signal_str(None, None) if self._show_signal else ""
-        ack = "[ack] " if self._ack_mode and not text.startswith("[ack]") else ""
+        ack = "\\[ack] " if self._ack_mode and not text.startswith("[ack]") else ""
         mid = f" (msg {dedup & 0xFF})" if dedup is not None else ""
-        self._add_message(f"[{timestamp()}] {sig}{ack}{text}{mid}", "sent")
+        name = self._own_name()
+        # Escape [ in signal and user text so Rich markup only applies to [bold]
+        sig_esc = sig.replace("[", "\\[")
+        text_esc = text.replace("[", "\\[")
+        mid_esc = mid.replace("[", "\\[")
+        self._add_message(
+            f"\\[{timestamp()}] {sig_esc}{ack}[bold]{name}[/bold]: {text_esc}{mid_esc}",
+            markup=True,
+        )
 
     def _add_received_msg(self, name: str, text: str, rssi=None, snr=None) -> None:
         sig = self._signal_str(rssi, snr) if self._show_signal else ""
-        self._add_message(f"[{timestamp()}] {sig}{name}: {text}", "received")
+        self._add_message(f"[{timestamp()}] {sig}{name}: {text}")
 
     def _add_decrypt_failed(self, rssi: int | None, snr: int | None) -> None:
         sig = self._signal_str(rssi, snr) if self._show_signal else ""
-        self._add_message(f"[{timestamp()}] {sig}[decryption failed]", "system")
+        self._add_message(f"[{timestamp()}] {sig}-- decryption failed", "system")
 
     def _add_system(self, text: str) -> None:
-        self._add_message(f"[{timestamp()}] {text}", "system")
+        self._add_message(f"[{timestamp()}] -- {text}", "system")
 
     def _sender_name(self, uid: int) -> str:
         """Display name for a user ID."""
@@ -357,7 +357,7 @@ class LoRaChat(App):
     def _add_received_ack(self, name: str, acked_dedup: int, rssi=None, snr=None) -> None:
         sig = self._signal_str(rssi, snr) if self._show_signal else ""
         seq = acked_dedup & 0xFF
-        self._add_message(f"[{timestamp()}] {sig}{name} received (msg {seq})", "ack")
+        self._add_message(f"[{timestamp()}] {sig}{name}: received (msg {seq})", "system")
 
     def _add_name_change(self, uid: int, old: str | None, new: str) -> None:
         if old:
