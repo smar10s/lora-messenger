@@ -24,8 +24,7 @@ from protocol import (
 
 
 # 24-bit colors
-COLOR_MSG = "rgb(230,230,230)"
-COLOR_SYSTEM = "rgb(140,140,140)"
+# (removed — using theme CSS variables instead)
 
 # Max message length: 255 (LoRa packet) - 3 (TTL+DEDUP_HI+DEDUP_LO)
 # - 1 (CMD byte) - 28 (AES-GCM nonce+tag) = 223 bytes.
@@ -211,18 +210,18 @@ class LoRaChat(App):
 
     #chat-log {
         height: 1fr;
-        border-bottom: solid rgb(60,60,60);
+        border-bottom: solid $border;
         scrollbar-size: 1 1;
     }
 
     .message {
         width: 100%;
         padding: 0 1;
-        color: """ + COLOR_MSG + """;
+        color: $foreground;
     }
 
     .system {
-        color: """ + COLOR_SYSTEM + """;
+        color: $foreground-muted;
         text-style: italic;
     }
 
