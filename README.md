@@ -117,7 +117,7 @@ Type a message and press Enter to broadcast. Up/Down arrows recall history.
 | `/key` | disable encryption |
 | `/signal` | toggle RSSI/SNR display |
 | `/ttl N` | set hop count (1-5, default 3) |
-| `/name <nick>` | set your nickname |
+| `/nick <nick>` | set your nickname |
 | `/ack` | toggle delivery acknowledgement |
 | `/exit` | quit |
 

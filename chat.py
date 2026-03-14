@@ -179,8 +179,8 @@ class HistoryInput(Input):
 
 
 HELP_TEXT = """/help       show this message
-/name <n>   set your display name (broadcast to peers)
-/name       show current name and user id
+/nick <n>   set your display name (broadcast to peers)
+/nick       show current name and user id
 /ack        toggle ack-request mode on/off
 /ack <msg>  send a single message requesting acknowledgement
 /key <pass> enable AES-256-GCM encryption
@@ -190,7 +190,7 @@ HELP_TEXT = """/help       show this message
 /theme <t>  set color theme (/theme to list)
 /exit       quit (or ctrl+q)"""
 
-SLASH_COMMANDS = ["/help", "/name", "/ack", "/key", "/signal", "/ttl", "/theme", "/exit"]
+SLASH_COMMANDS = ["/help", "/nick", "/ack", "/key", "/signal", "/ttl", "/theme", "/exit"]
 
 
 class LoRaChat(App):
@@ -292,7 +292,7 @@ class LoRaChat(App):
         )
         self._modem.start()
         self.query_one("#input", HistoryInput).focus()
-        self._add_system(f"your id is {self._user_id}. use /name to set a display name")
+        self._add_system(f"your id is {self._user_id}. use /nick to set a display name")
 
     def _on_rx(self, pkt: RxPacket) -> None:
         """Called from modem's reader thread on packet receive."""
@@ -472,7 +472,7 @@ class LoRaChat(App):
                         self._add_system("encryption disabled")
                     else:
                         self._add_system("usage: /key <passphrase> to enable, /key to disable")
-            elif slash == "/name":
+            elif slash == "/nick":
                 if arg:
                     self._user_name = arg.strip()
                     self._names[self._user_id] = self._user_name
@@ -488,7 +488,7 @@ class LoRaChat(App):
                     if self._user_name:
                         self._add_system(f"you are {self._user_name} (id {self._user_id})")
                     else:
-                        self._add_system(f"no name set (id {self._user_id}). usage: /name <name>")
+                        self._add_system(f"no name set (id {self._user_id}). usage: /nick <name>")
             elif slash == "/ack":
                 if arg:
                     if not self._modem.connected:
