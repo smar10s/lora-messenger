@@ -59,7 +59,7 @@ only pyserial + cryptography; SDR support is optional.
   (arm64) and Pinebook Pro (aarch64 Linux). `./run` wrapper only needed for
   SDR support on macOS.
 - **Dev environment**: arduino-cli with RAK BSP, Python venv with textual +
-  pyserial + cryptography. SDR extras: pyadi-iio + scipy + numpy + libiio v0.25.
+  pyserial + cryptography. SDR extras: pyadi-iio + scipy + numpy + libiio v0.25/v0.26 native library.
 
 ## Project structure
 
@@ -234,6 +234,21 @@ docs/plans/          design documents (historical)
 | `tools/test_pinephone_stress.py` | 60s sustained I2C poll stress test |
 | `tools/test_pinephone_chat.py` | Headless chat protocol test (pack/unpack through modem) |
 | `tools/test_pinephone_ack.py` | ACK debugging test (historical) |
+
+## Interop and range testing
+
+All three device types can communicate:
+- Pinebook Pro + RAK (serial)
+- PinePhone + backplate (I2C/SPI)
+- MacBook + Pluto SDR (USB/pyadi-iio)
+
+**Range tests completed:**
+- RAK to RAK: tested (range/conditions not recorded — TODO: re-run and record)
+- RAK to PinePhone: same range test as RAK-to-RAK (conditions not recorded)
+- PinePhone to Pluto: close range only (within a few meters), comms verified
+
+**Not yet tested:**
+- Pluto range test (all Pluto testing has been within a few meters)
 
 ## What's next (rough ideas, not ordered)
 
