@@ -545,6 +545,30 @@ def main():
         port = detect_port()
 
     if port == "sdr":
+        # Preflight: verify libiio + Pluto before entering the TUI.
+        # Without these checks, failures get swallowed by the modem's
+        # retry loop and the user sees a silent, permanent "not connected".
+        try:
+            import iio
+        except (OSError, AttributeError, ImportError) as exc:
+            print(
+                f"error: libiio native library not usable: {exc}\n"
+                "The pylibiio package provides Python bindings but requires\n"
+                "the libiio shared library (v0.25/v0.26) installed separately.\n"
+                "See README.md \"SDR (Pluto)\" for install steps.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            iio.Context("usb:")
+        except Exception:
+            print(
+                "error: no Pluto SDR found on USB.\n"
+                "Check that the Pluto is connected and powered.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         from modem.sdr import PlutoModem
         modem = PlutoModem()
     elif port == "pinephone":

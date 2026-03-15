@@ -86,14 +86,35 @@ and radio management directly over I2C.
 
 ### SDR (Pluto)
 
+Requires [libiio](https://github.com/analogdevicesinc/libiio) (the native
+C library, not just the Python bindings). Install the latest
+[v0.x release](https://github.com/analogdevicesinc/libiio/releases/tag/v0.26)
+for your platform — `pip install` only gets the Python ctypes wrapper, not
+the shared library itself.
+
+> **Why v0.x?** The PyPI bindings (`pylibiio`) use the libiio v0 API.
+> v1.x has an [incompatible API](https://github.com/analogdevicesinc/libiio/wiki/libiio_0_to_1)
+> and its [Python bindings](https://github.com/analogdevicesinc/libiio/tree/main/bindings/python)
+> are not yet on PyPI.
+
+On macOS, the `./run` wrapper sets `DYLD_LIBRARY_PATH` to `.venv/lib/`,
+so place the dylib there:
+
+```bash
+# macOS only — after extracting libiio.dylib:
+cp libiio.dylib .venv/lib/
+ln -sf libiio.dylib .venv/lib/libiio.so.1
+```
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install textual pyserial cryptography pyadi-iio scipy numpy
 ```
 
-On macOS, use `./run chat.py sdr` instead of `python chat.py sdr` — the
-wrapper sets `DYLD_LIBRARY_PATH` for libiio.
+Verify: `./run -c "import iio; print(iio.version)"`
+
+On macOS, use `./run chat.py sdr` instead of `python chat.py sdr`.
 
 ## Usage
 
