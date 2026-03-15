@@ -29,11 +29,13 @@ only pyserial + cryptography; SDR support is optional.
 
 - **Software LoRa PHY** (`lora/`): full modulator + demodulator in pure
   Python/NumPy.
-  - RX (SX1262 -> Pluto): 15/15 live packets decoded with CRC OK
+  - RX (SX1262 -> Pluto): 24/25 live packets decoded with CRC OK (96%)
   - TX (Pluto -> SX1262): **working for all payload sizes** (5B, 8B, 10B, 12B,
     20B, 32B verified on hardware). Two bugs fixed: demod dechirp ±1 bin errors
     and missing header checksum.
   - Round-trip (synthetic): **128/128 sizes pass** (1-128 bytes).
+  - CFO robustness (synthetic): **0-25 bins fractional CFO**, all non-degenerate
+    offsets decode correctly (52/56 pass, 4 exact half-bin cases skipped).
 - **PlutoSDR Modem** (`modem/sdr.py`): `PlutoModem` wraps the Pluto behind the
   `LoRaModem` ABC. Two-thread architecture (reader + demod). Chat TUI works:
   `python chat.py sdr`. RX works reliably. TX now works for all payload sizes.
@@ -96,6 +98,7 @@ tools/               SDR development tools
   test_pinephone_stress.py  I2C poll stress test (60s)
   test_pinephone_chat.py    Headless chat protocol test
   test_pinephone_ack.py     ACK debugging test (historical)
+  test_phy.py               Live PHY decode test (RAK beacon -> Pluto)
 tests/               test suite
 docs/plans/          design documents (historical)
 ```
@@ -195,6 +198,13 @@ docs/plans/          design documents (historical)
 - Pluto's pyadi-iio returns 12-bit ADC values in 16-bit containers (range ±2048,
   not ±32768). At max gain the noise floor sits around +22 dBFS and LoRa bursts
   hit +68 dBFS.
+- **Pluto crystal thermal settling**: the Pluto's XO drifts rapidly after USB
+  connection — CFO can sweep >100 bins in the first 60 seconds. After ~90s of
+  continuous RX the CFO stabilises to within ±1 bin between captures. Any test
+  that captures IQ immediately after connecting will see wildly varying CFO and
+  near-zero decode rate. The `PlutoModem` in `modem/sdr.py` is unaffected because
+  it runs continuously, but standalone scripts (`tools/listen.py`,
+  `tools/test_phy.py`) need a warmup period or will produce misleading results.
 - **LoRa CRC-16 is non-standard**: CRC-16/CCITT (poly 0x1021, init 0) over the
   first `(payload_len - 2)` bytes, XORed with `payload[-1] | (payload[-2] << 8)`,
   stored little-endian. This matches gr-lora_sdr's implementation. Our demod and
@@ -216,6 +226,14 @@ docs/plans/          design documents (historical)
   chip-rate (N-sample) reference. This gives 0/128 symbol errors. The
   oversampled approach is still fine for preamble detection where ±1 is
   tolerable.
+- **Sub-bin CFO estimation**: `_align_preamble` returns a fractional CFO
+  via 16x zero-padded FFT of the chip-rate preamble dechirp. This is used
+  only for time-domain frequency correction in `demodulate()`; alignment
+  and data-start finding still use the integer bin. Attempting to use the
+  sub-bin value for alignment or to restructure the data-start flow causes
+  regressions on real RF — the existing sweep-based approach (`cfo_residual`
+  + `ds_off` + `shift`) is robust to the ±1-2 bin discrepancy between
+  oversampled and chip-rate dechirp, and must not be bypassed.
 
 ## Tools
 
@@ -234,6 +252,7 @@ docs/plans/          design documents (historical)
 | `tools/test_pinephone_stress.py` | 60s sustained I2C poll stress test |
 | `tools/test_pinephone_chat.py` | Headless chat protocol test (pack/unpack through modem) |
 | `tools/test_pinephone_ack.py` | ACK debugging test (historical) |
+| `tools/test_phy.py` | Live PHY decode test (RAK beacon → Pluto, CRC stats) |
 
 ## Interop and range testing
 
@@ -768,3 +787,60 @@ enough to be self-throttling.
 
 **Verified:** bidirectional chat with `/ack` between laptop (RAK) and
 PinePhone — ACKs delivered in both directions.
+
+### 2026-03-15: sub-bin CFO estimation for software PHY
+
+Improved the demodulator's fractional-CFO handling. The preamble dechirp
+previously gave only an integer-bin CFO estimate; the fractional residual
+after time-domain correction caused ~17% CRC failures on some RAK+Pluto
+pairs with large crystal offsets (~16 bins / ~15.6 kHz).
+
+**What changed:**
+
+- `lora/demod.py`: `_align_preamble` now returns a sub-bin CFO estimate
+  (via 16x zero-padded FFT of the chip-rate preamble dechirp, averaged
+  across all 8 preamble symbols). `demodulate()` uses this for time-domain
+  frequency correction instead of the integer bin. All other logic
+  (alignment, data start finding, residual/shift sweeps) unchanged.
+- `tests/test_cfo_robustness.py`: new test file — 56 parametrised tests
+  covering integer CFO 0–24, fractional CFO (X.3, X.5, X.7), CFO + noise
+  (20 dB SNR), and various payload sizes at CFO=16.4.
+- `tools/test_phy.py`: new live hardware test — captures IQ from Pluto
+  while RAK sends beacon packets, reports per-packet CRC status and
+  aggregate statistics.
+
+**Key finding — minimal change beats restructuring:**
+
+The first attempt restructured the demod flow: run `_find_data_start` on
+the CFO-corrected signal, tighten preamble alignment constraints, use
+sub-bin CFO for everything. This passed all 251 synthetic CFO values
+(0–25 bins in 0.1 steps) but caused a severe regression on real RF:
+35% CRC pass rate vs 96% baseline.
+
+Root cause: the oversampled dechirp (used for preamble alignment) and the
+chip-rate dechirp (used for data symbols) disagree by 1–2 bins on real RF.
+The existing sweep-based decode (`cfo_residual in [0, 1, -1]` +
+`ds_off in ±16` + `shift in [0..±3]`) is specifically designed to absorb
+this discrepancy. Restructuring the flow to depend on a single precise CFO
+value removed the redundancy the sweeps provide.
+
+The fix that works: use the sub-bin estimate *only* for time-domain
+correction (a single line change from `cfo * bw / N` to `cfo_frac * bw / N`),
+and leave everything else untouched.
+
+**Investigation — Pluto crystal thermal settling:**
+
+During hardware testing, initial captures showed wildly varying CFO (0–127
+bins) and near-zero decode rate. After ~90 seconds of continuous RX the
+CFO stabilises. This was the cause of the earlier "0/16 anomalous" runs
+mentioned in the analysis. The `PlutoModem` runs continuously so it's
+unaffected; standalone test scripts need a warmup period.
+
+**Verified:**
+
+- 226/226 non-hardware tests pass, 4 exact half-bin cases skipped
+  (degenerate in synthetic tests, don't occur in real RF)
+- 128/128 roundtrip sizes still pass
+- Live hardware (RAK beacon → Pluto): 24/25 = 96% CRC OK (baseline was
+  23/24 = 96%)
+- Live chat (RAK messenger ↔ Pluto SDR modem): working

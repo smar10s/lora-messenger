@@ -215,7 +215,36 @@ def _align_preamble(iq, coarse, p):
         preamble_syms.append(sym)
     cfo = Counter(preamble_syms).most_common(1)[0][0]
 
-    return best, int(cfo)
+    # Sub-bin CFO estimation using zero-padded FFT on chip-rate dechirp.
+    # This is used ONLY for time-domain frequency correction in demodulate(),
+    # not for alignment or data start finding (which use the integer cfo).
+    ZP_FACTOR = 16  # 16x zero-padding -> 1/16 bin resolution
+    dc_cr_ref = np.conj(_upchirp_cr(N, symbol=0))
+    frac_cfos = []
+    for k in range(8):
+        seg = iq[best + k * sps:best + (k + 1) * sps]
+        if len(seg) < sps:
+            continue
+        folded = seg[:sps].reshape(N, os).sum(axis=1)
+        spec = np.abs(np.fft.fft(folded * dc_cr_ref, n=N * ZP_FACTOR))
+        peak_idx = int(np.argmax(spec))
+        frac_cfos.append(peak_idx / ZP_FACTOR)
+
+    if frac_cfos:
+        ref = frac_cfos[0]
+        unwrapped = []
+        for v in frac_cfos:
+            diff = v - ref
+            if diff > N / 2:
+                v -= N
+            elif diff < -N / 2:
+                v += N
+            unwrapped.append(v)
+        cfo_frac = float(np.mean(unwrapped))
+    else:
+        cfo_frac = float(cfo)
+
+    return best, int(cfo), cfo_frac
 
 
 # ---------------------------------------------------------------------------
@@ -422,19 +451,18 @@ def demodulate(iq, params=None, verbose=True):
     for idx, (coarse, coarse_cfo) in enumerate(preambles):
         if verbose:
             print(f"\n--- Packet {idx} ---")
-        preamble_start, cfo = _align_preamble(iq, coarse, params)
+        preamble_start, cfo, cfo_frac = _align_preamble(iq, coarse, params)
         if verbose:
-            print(f"Preamble @ sample {preamble_start} (t={preamble_start/params.fs:.4f}s), CFO={cfo}")
+            print(f"Preamble @ sample {preamble_start} (t={preamble_start/params.fs:.4f}s), CFO={cfo} (sub-bin: {cfo_frac:.2f})")
 
         data_start = _find_data_start(iq, preamble_start, cfo, params)
         if verbose:
-            print(f"Data @ ~sample {data_start} ({(data_start-preamble_start)/sps:.2f} symbols), CFO={cfo}")
+            print(f"Data @ ~sample {data_start} ({(data_start-preamble_start)/sps:.2f} symbols)")
 
-        # Apply time-domain CFO correction, then sweep data start offset
-        # and symbol shift. Time-domain correction removes the frequency
-        # offset from all symbols at once, giving cleaner dechirp spectra
-        # than the integer-bin CFO downchirp approach.
-        freq_offset = cfo * params.bw / N
+        # Apply time-domain CFO correction using the sub-bin estimate from
+        # the preamble. This is more precise than integer-bin correction,
+        # reducing the residual that the cfo_residual sweep must cover.
+        freq_offset = cfo_frac * params.bw / N
         # Extract enough of the packet: preamble through end of data
         pkt_len = data_start - preamble_start + 200 * sps  # enough for max LoRa payload
         pkt_end = min(preamble_start + pkt_len, len(iq))
@@ -503,7 +531,7 @@ def demodulate(iq, params=None, verbose=True):
                         res["_score"] = score
                         best_result = res
                         best_hdr = hdr
-                        best_cfo_used = cfo
+                        best_cfo_used = cfo_frac
 
                     if score >= 100:
                         _done = True
