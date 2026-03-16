@@ -89,6 +89,13 @@ def detect_port():
     if len(ports) == 1:
         return ports[0]
     if len(ports) == 0:
+        # No serial device — check for RAK on raw USB (missing cdc_acm)
+        try:
+            from modem.rak_usb import find_rak_usb
+            if find_rak_usb() is not None:
+                return "rak_usb"
+        except ImportError:
+            pass
         # Check for PinePhone backplate
         if os.path.exists("/dev/i2c-2"):
             return "pinephone"
@@ -571,6 +578,9 @@ def main():
 
         from modem.sdr import PlutoModem
         modem = PlutoModem()
+    elif port == "rak_usb":
+        from modem.rak_usb import RAKUSBModem
+        modem = RAKUSBModem()
     elif port == "pinephone":
         from modem.pinephone import PinePhoneModem
         modem = PinePhoneModem()

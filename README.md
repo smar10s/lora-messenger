@@ -24,7 +24,8 @@ Any combination of:
 
 - **RAK11300** (RAK19007 + RAK11300 WisBlock) with a LoRa antenna.
   Always connect the antenna before powering — TX without antenna
-  damages the SX1262 PA.
+  damages the SX1262 PA. Works over serial (`/dev/ttyACM*`) or raw USB
+  on systems without `cdc_acm` (e.g. PinePhone postmarketOS).
 - **PinePhone** (original) with the LoRa backplate (v1.0). The backplate
   has an SX1262 behind an ATtiny84 I2C-to-SPI bridge on `/dev/i2c-2`.
   No firmware to flash — the Python driver talks directly to the radio.
@@ -39,6 +40,23 @@ One device is enough to run the app. Two or more to actually chat.
 
 ```bash
 pip install textual pyserial cryptography
+```
+
+On Linux systems without the `cdc_acm` kernel module (no `/dev/ttyACM*`
+device), also install pyusb:
+
+```bash
+pip install pyusb
+```
+
+The RAK11300's RP2040 presents as USB VID `2e8a` PID `00c0`. If the
+kernel doesn't create a serial device, `chat.py` auto-detects it via
+raw USB. You'll need a udev rule for permissions:
+
+```bash
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="00c0", MODE="0666"' \
+  | sudo tee /etc/udev/rules.d/99-rak11300.rules
+sudo udevadm trigger
 ```
 
 Run `python chat.py` from the project root. Works on any platform with
@@ -121,8 +139,9 @@ On macOS, use `./run chat.py sdr` instead of `python chat.py sdr`.
 ### Chat
 
 ```bash
-python chat.py                     # auto-detect (RAK serial or PinePhone I2C)
+python chat.py                     # auto-detect (RAK serial, RAK USB, or PinePhone I2C)
 python chat.py /dev/cu.usbmodem101 # explicit RAK serial port
+python chat.py rak_usb             # RAK over raw USB (no cdc_acm)
 python chat.py pinephone           # PinePhone backplate
 python chat.py sdr                 # Pluto SDR
 ```
@@ -163,6 +182,7 @@ protocol.py          chat protocol (1-byte command header)
 modem/               modem abstraction (LoRaModem ABC + implementations)
   base.py            LoRaModem interface and RxPacket dataclass
   rak.py             RAK serial modem (pyserial)
+  rak_usb.py         RAK USB modem (pyusb, no kernel cdc_acm needed)
   sdr.py             PlutoSDR modem (software LoRa PHY)
   pinephone.py       PinePhone backplate modem (I2C-SPI bridge + SX1262)
   loopback.py        loopback modem (testing)

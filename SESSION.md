@@ -21,9 +21,10 @@ is wrong — fix the architecture, don't skip the test.
 ## What this is
 
 LoRa messenger with encrypted chat and mesh relay. Supports RAK11300
-(RP2040 + SX1262) devices over serial and ADALM-Pluto SDR via a
-pure-Python LoRa PHY. Designed to be portable — the core app needs
-only pyserial + cryptography; SDR support is optional.
+(RP2040 + SX1262) devices over serial or raw USB, the PinePhone LoRa
+backplate over I2C, and ADALM-Pluto SDR via a pure-Python LoRa PHY.
+Designed to be portable — the core app needs only pyserial + cryptography;
+SDR support is optional.
 
 ## Current state
 
@@ -52,14 +53,18 @@ only pyserial + cryptography; SDR support is optional.
   message acknowledgement (`/ack`), regular messages. CMD byte is inside the
   encryption envelope; UID is in cleartext (acceptable — it's a random byte).
 - **Modem abstraction** (`modem/`): `LoRaModem` base class with RAK serial,
-  PlutoSDR, and loopback implementations. Chat TUI is modem-agnostic.
+  RAK USB (raw pyusb), PlutoSDR, PinePhone, and loopback implementations.
+  Chat TUI is modem-agnostic.
 - **Firmware** (`firmware/`): single firmware for all devices. Messenger when
   serial is connected, relay when not. `make flash` from `firmware/`.
   Relay header: `[TTL:8][DEDUP_HI:8][DEDUP_LO:8]` — 16-bit opaque dedup token.
 - **Portability**: core app (chat.py, protocol.py, modem/rak.py) runs on any
-  platform with Python 3.10+ and pyserial + cryptography. Tested on macOS
-  (arm64) and Pinebook Pro (aarch64 Linux). `./run` wrapper only needed for
-  SDR support on macOS.
+  platform with Python 3.10+ and pyserial + cryptography. On Linux systems
+  without `cdc_acm` (e.g. PinePhone postmarketOS), `modem/rak_usb.py`
+  provides a pyusb fallback — auto-detected when the RAK is visible on USB
+  but no `/dev/ttyACM*` exists. Tested on macOS (arm64), Pinebook Pro
+  (aarch64 Linux), and PinePhone (aarch64 postmarketOS). `./run` wrapper
+  only needed for SDR support on macOS.
 - **Dev environment**: arduino-cli with RAK BSP, Python venv with textual +
   pyserial + cryptography. SDR extras: pyadi-iio + scipy + numpy + libiio v0.25/v0.26 native library.
 
@@ -71,6 +76,7 @@ protocol.py          chat protocol (1-byte command header)
 modem/               modem abstraction
   base.py            LoRaModem ABC, RxPacket dataclass
   rak.py             RAK serial modem
+  rak_usb.py         RAK USB modem (pyusb, no kernel cdc_acm needed)
   sdr.py             PlutoSDR modem (software LoRa PHY)
   pinephone.py       PinePhone backplate modem (I2C-SPI bridge + SX1262)
   loopback.py        loopback modem (testing)
@@ -123,8 +129,9 @@ docs/plans/          design documents (historical)
 - **Modem abstraction**: `modem/base.py` defines the interface (send, receive,
   start, stop, connected). Chat TUI takes any modem implementation.
 - **Minimal core dependencies**: `chat.py` + `protocol.py` + `modem/rak.py`
-  need only pyserial + cryptography. SDR support (`modem/sdr.py`, `lora/`)
-  adds numpy + scipy + pyadi-iio. No forced dependency on SDR stack.
+  need only pyserial + cryptography. `modem/rak_usb.py` adds pyusb as an
+  optional fallback for systems without `cdc_acm`. SDR support (`modem/sdr.py`,
+  `lora/`) adds numpy + scipy + pyadi-iio. No forced dependency on SDR stack.
 - **No crypto antipatterns**: either proper AES-256-GCM or plaintext. No
   unauthenticated encryption, no XOR, no half-measures. The auth tag matters
   even for a toy — it detects tampering from anyone on the same frequency.
@@ -844,3 +851,70 @@ unaffected; standalone test scripts need a warmup period.
 - Live hardware (RAK beacon → Pluto): 24/25 = 96% CRC OK (baseline was
   23/24 = 96%)
 - Live chat (RAK messenger ↔ Pluto SDR modem): working
+
+### 2026-03-15: RAK USB modem for PinePhone (no cdc_acm)
+
+Added `modem/rak_usb.py` — a userspace USB-CDC transport for the RAK11300
+using pyusb, bypassing the kernel `cdc_acm` driver entirely. This enables
+RAK devices on Linux systems where `CONFIG_USB_ACM` is disabled (e.g.
+postmarketOS allwinner kernel for PinePhone).
+
+**Problem:** The PinePhone's postmarketOS kernel (linux-postmarketos-allwinner)
+is built with `# CONFIG_USB_ACM is not set`. The RAK11300 (RP2040, VID
+`2e8a` PID `00c0`) presents as USB CDC-ACM, so no `/dev/ttyACM*` device
+appears. This is an omission in the kernel config, not a policy decision —
+the allwinner kernel is intentionally minimal, and nobody has filed a request
+to enable it. The newer kernel in the repos (`6.0.2`) also doesn't include it.
+Not fixed as of kernel `6.11.5` (Nov 2024).
+
+**Solution:** `RAKUSBModem` talks directly to the RP2040's USB bulk endpoints
+via pyusb. Same binary framing protocol as `RAKModem`, different transport.
+`detect_port()` auto-detects: tries `/dev/ttyACM*` first, falls back to raw
+USB if the device is visible by VID:PID but no serial device exists.
+
+**What changed:**
+- `modem/rak_usb.py`: new file. `RAKUSBModem` implementing `LoRaModem` ABC.
+  Claims both CDC control (interface 0) and data (interface 1) interfaces.
+  Asserts DTR+RTS via `SET_CONTROL_LINE_STATE` — required for the RP2040's
+  TinyUSB CDC stack to accept bulk OUT data. Drains stale data on connect.
+  Reader thread with reconnect logic (same pattern as `RAKModem`).
+- `chat.py`: `detect_port()` checks for RAK USB VID:PID when no serial port
+  found. New `rak_usb` modem type in `main()`. Detection order: serial ports
+  → RAK USB → PinePhone I2C → error.
+
+**Bugs found and fixed during testing:**
+1. **Write timeout blocking UI thread**: `send()` runs on Textual's main
+   thread. pyusb `write()` with no explicit timeout blocks for 1s on failure.
+   Fixed: explicit 500ms write timeout.
+2. **`_emit_status` from main thread**: on write failure, `send()` called
+   `_emit_status("disconnected")` which invoked `call_from_thread` — illegal
+   from Textual's own thread. Fixed: `send()` silently sets `_dev = None`;
+   the reader thread detects this and emits status from its own thread.
+3. **CDC init**: initial version only claimed interface 1 (data). The RP2040
+   TinyUSB stack requires interface 0 (control) to be claimed before
+   `SET_CONTROL_LINE_STATE` and `SET_LINE_CODING` class requests work.
+   Without DTR asserted, the RP2040 ignores all bulk OUT data. Fixed: claim
+   both interfaces, send control requests to wIndex=0 (control interface).
+
+**PinePhone USB-C + keyboard case notes (researched, not implemented):**
+- The keyboard case's USB-C port is charging only — no data lines.
+- The phone's USB-C port is dangerous with the keyboard attached: the
+  keyboard's IP5209 VOUT and the phone's OTG 5V boost drive the same VBUS
+  line. People have smoked IP5209 chips this way.
+- The LoRa backplate (I2C, address `0x28`) can coexist with the keyboard
+  MCU (I2C, address `0x15`) on the same pogo pin I2C bus — no address
+  conflict. The mechanical stacking is the only obstacle (pogo pins mate
+  directly, no room for backplate). Soldering 4 wires (SDA, SCL, GND, VCC)
+  from the backplate pads to the keyboard PCB's pogo pads would work.
+
+**Verified on PinePhone (postmarketOS v22.06.1, kernel 5.17.5):**
+- Auto-detection: `detect_port()` returns `"rak_usb"`
+- USB claim + CDC init: both interfaces claimed, DTR asserted
+- TX: burst of 5 messages, all sent without timeout
+- RX: messages received from laptop RAK
+- Bidirectional chat: both directions working through `chat.py`
+
+**Udev rule for permissions:**
+```
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="00c0", MODE="0666"
+```
